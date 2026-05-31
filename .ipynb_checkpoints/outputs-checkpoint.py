@@ -6,7 +6,9 @@ from vllm.logprobs import SampleLogprobs
 from vllm.lora.request import LoRARequest
 
 from collections.abc import Sequence as GenericSequence
+from dataclasses import dataclass
 
+@dataclass
 class VLLMCompletionOutput(CompletionOutput):
     """The output data of one completion output of a request.
 
