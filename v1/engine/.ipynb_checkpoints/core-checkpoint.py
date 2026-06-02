@@ -1,11 +1,23 @@
 from vllm.v1.engine import EngineCore, EngineCoreOutputs
 from inference_aware_grpo_training.v1.outputs import VLLMModelRunnerOutput
+from inference_aware_grpo_training.v1.core.sched.scheduler import VLLMScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 
 class VLLMEngineCore(EngineCore):
 
     def __init__(self):
         super().__init__()
+
+        self.scheduler: SchedulerInterface = VLLMScheduler(
+            vllm_config=vllm_config,
+            kv_cache_config=kv_cache_config,
+            structured_output_manager=self.structured_output_manager,
+            include_finished_set=include_finished_set,
+            log_stats=self.log_stats,
+            block_size=scheduler_block_size,
+            hash_block_size=hash_block_size,
+        )
 
     def compute_spec_decode_stats(
         self,
