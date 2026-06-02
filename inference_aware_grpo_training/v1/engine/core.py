@@ -1,4 +1,5 @@
-from vllm.v1.engine import EngineCore, EngineCoreOutputs
+from vllm.v1.engine import EngineCoreOutputs
+from vllm.v1.engine.core import EngineCore
 from inference_aware_grpo_training.v1.outputs import VLLMModelRunnerOutput
 from inference_aware_grpo_training.v1.core.sched.scheduler import VLLMScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
