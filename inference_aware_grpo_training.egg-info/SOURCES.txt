@@ -4,6 +4,8 @@ inference_aware_grpo_training/outputs.py
 inference_aware_grpo_training.egg-info/PKG-INFO
 inference_aware_grpo_training.egg-info/SOURCES.txt
 inference_aware_grpo_training.egg-info/dependency_links.txt
+inference_aware_grpo_training.egg-info/not-zip-safe
+inference_aware_grpo_training.egg-info/requires.txt
 inference_aware_grpo_training.egg-info/top_level.txt
 inference_aware_grpo_training/entrypoints/__init__.py
 inference_aware_grpo_training/entrypoints/llm.py

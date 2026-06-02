@@ -1,14 +1,48 @@
-from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.engine.core import EngineCore
-from inference_aware_grpo_training.v1.outputs import VLLMModelRunnerOutput
+from vllm.v1.core.sched.interface import SchedulerInterface
+from vllm.config import ParallelConfig, VllmConfig
+
 from inference_aware_grpo_training.v1.core.sched.scheduler import VLLMScheduler
+from inference_aware_grpo_training.v1.outputs import VLLMModelRunnerOutput
+from vllm.v1.executor import Executor
+from collections.abc import Callable, Generator
+
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
+from vllm.v1.engine import EngineCoreOutputs
+
 
 class VLLMEngineCore(EngineCore):
 
-    def __init__(self):
-        super().__init__()
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        executor_class: type[Executor],
+        log_stats: bool,
+        executor_fail_callback: Callable | None = None,
+        include_finished_set: bool = False,
+    ):
+        # IMPORTANT: pass required args to EngineCore if your vLLM version expects them
+        super().__init__(vllm_config=vllm_config, executor_class=executor_class, log_stats=log_stats)
+
+        # Setup KV Caches and update CacheConfig after profiling.
+        kv_cache_config = self._initialize_kv_caches(vllm_config)
+        self.structured_output_manager = StructuredOutputManager(vllm_config)
+
+        # Setup scheduler.
+        Scheduler = vllm_config.scheduler_config.get_scheduler_cls()
+
+        if len(kv_cache_config.kv_cache_groups) == 0:  # noqa: SIM102
+            # Encoder models without KV cache don't support
+            # chunked prefill. But do SSM models?
+            if vllm_config.scheduler_config.enable_chunked_prefill:
+                logger.warning("Disabling chunked prefill for model without KVCache")
+                vllm_config.scheduler_config.enable_chunked_prefill = False
+
+        scheduler_block_size = (
+            vllm_config.cache_config.block_size
+            * vllm_config.parallel_config.decode_context_parallel_size
+            * vllm_config.parallel_config.prefill_context_parallel_size
+        )
 
         self.scheduler: SchedulerInterface = VLLMScheduler(
             vllm_config=vllm_config,
@@ -17,7 +51,6 @@ class VLLMEngineCore(EngineCore):
             include_finished_set=include_finished_set,
             log_stats=self.log_stats,
             block_size=scheduler_block_size,
-            hash_block_size=hash_block_size,
         )
 
     def compute_spec_decode_stats(
