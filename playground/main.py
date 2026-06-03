@@ -10,14 +10,13 @@ def main():
     torch.cuda.ipc_collect()
 
     llm = VLLM(
-        model="Qwen/Qwen2.5-0.5B-Instruct",
-        gpu_memory_utilization=0.15,
+        model="Qwen/Qwen2.5-1.5B-Instruct",
+        gpu_memory_utilization=0.4,
         max_model_len=1024,
         enforce_eager=False,
         speculative_config={
-            "method": "ngram",
+            "model": "Qwen/Qwen2.5-0.5B-Instruct",
             "num_speculative_tokens": 5,
-            "prompt_lookup_max": 5,
         },
     )
 
@@ -32,6 +31,9 @@ def main():
     prompts = [
         "Summarize: Speculative decoding uses a fast draft model to propose tokens.",
         "Summarize: GRPO is a RL algorithm for training language models.",
+        "Summarize: The transformer architecture uses self-attention to model long-range dependencies.",
+        "Summarize: Reinforcement learning from human feedback aligns language models with human preferences.",
+        "Summarize: KV caching stores key and value tensors to avoid recomputing them across decode steps.",
     ]
 
     outputs = llm.generate(prompts, sampling_params)
