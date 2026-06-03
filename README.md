@@ -18,6 +18,7 @@ This repository provides:
 - Per-request acceptance rate statistics accessible after `generate()`
 - A drop-in replacement for `vllm.LLM`
 - A full GRPO training loop with an inference-aware composite reward
+- GSM8K math training with exact answer correctness as the task score
 
 ---
 
@@ -155,6 +156,71 @@ The `task_score` defaults to `1.0` — plug in your own quality scorer via the `
 
 ---
 
+## GSM8K Math Training — `playground/train_grpo_math.py`
+
+Trains on [openai/gsm8k](https://huggingface.co/datasets/openai/gsm8k) (7,473 train / 1,319 test problems).  
+`task_score` is replaced with **exact answer correctness** (1.0 correct / 0.0 wrong).
+
+### Results — 50 Steps
+
+Target: `Qwen/Qwen2.5-1.5B-Instruct` · Draft: `Qwen/Qwen2.5-0.5B-Instruct`  
+500 training samples · batch=2 · G=2 rollouts · max_new_tokens=256 · lr=1e-6
+
+| Metric | Value |
+|--------|-------|
+| Baseline accuracy (GSM8K test) | 69.0% |
+| Final accuracy (GSM8K test) | **73.0%** |
+| Spec accept rate (avg) | **60–70%** |
+
+> Math reasoning produces significantly higher spec accept rates than general text (60–70% vs 20–30%), because chain-of-thought arithmetic follows structured, predictable patterns that the 0.5B draft model can anticipate.
+
+### Eval progression (every 10 steps)
+
+```
+Baseline eval on 100 test problems...
+  Baseline accuracy: 69.0%
+
+step    1 | loss= 0.0094 | correct=0.56 | accept=0.653 | latency=3263ms | reward=-2.390
+step    2 | loss=-0.0658 | correct=0.44 | accept=0.586 | latency=5033ms | reward=-4.474
+...
+step   10 | loss= 0.0022 | correct=0.88 | accept=0.653 | latency=3241ms | reward=-2.042
+  >>> Eval accuracy after step 10: 70.0%
+...
+step   20 | loss=-0.0235 | correct=0.81 | accept=0.662 | latency=3410ms | reward=-2.284
+  >>> Eval accuracy after step 20: 74.0%
+...
+step   30 | loss=-0.0194 | correct=0.25 | accept=0.593 | latency=4118ms | reward=-3.661
+  >>> Eval accuracy after step 30: 70.0%
+...
+step   40 | loss= 0.0074 | correct=0.75 | accept=0.668 | latency=3687ms | reward=-2.656
+  >>> Eval accuracy after step 40: 69.0%
+...
+step   50 | loss=-0.0571 | correct=0.69 | accept=0.642 | latency=4434ms | reward=-3.530
+  >>> Eval accuracy after step 50: 70.0%
+
+Final eval...
+  Baseline: 69.0%  →  Final: 73.0%
+```
+
+### Usage
+
+```bash
+python playground/train_grpo_math.py
+```
+
+Key config knobs in `GRPOConfig`:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `max_train_samples` | 500 | Set to `None` for all 7,473 examples |
+| `num_train_steps` | 50 | Training steps |
+| `eval_every` | 10 | Eval on test set every N steps |
+| `eval_samples` | 100 | Test problems per eval |
+| `num_rollouts_per_prompt` | 4 | G in GRPO |
+| `max_new_tokens` | 512 | Tokens for chain-of-thought |
+
+---
+
 ## Repository Structure
 
 ```
@@ -170,7 +236,8 @@ inference_aware_grpo_training/
 │       └── llm_engine.py       # VLLMEngine — patches make_client to avoid double model load
 playground/
 ├── main.py                     # Spec decode accept rate demo (5 requests)
-└── train_grpo.py               # Full GRPO training loop
+├── train_grpo.py               # Generic GRPO training loop
+└── train_grpo_math.py          # GRPO on GSM8K with answer correctness reward
 ```
 
 ---
