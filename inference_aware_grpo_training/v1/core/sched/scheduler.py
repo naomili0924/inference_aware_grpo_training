@@ -1,9 +1,18 @@
+import re
+import time
+from collections import defaultdict
+
+from vllm.logger import init_logger
+
+_UUID_SUFFIX = re.compile(r'-[0-9a-f]{8}$')
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
-from vllm.v1.request import Request
+from vllm.v1.request import Request, RequestStatus
+
+logger = init_logger(__name__)
 
 from inference_aware_grpo_training.v1.outputs import VLLMModelRunnerOutput
 from inference_aware_grpo_training.v1.engine import VLLMEngineCoreOutput, VLLMEngineCoreOutputs
@@ -12,7 +21,25 @@ from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.distributed.kv_events import EventPublisherFactory, KVEventBatch
 
 class VLLMScheduler(Scheduler):
-    
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._spec_decode_stats: dict[str, dict] = {}
+        self.finished_spec_decode_stats: dict[str, dict] = {}
+
+    def get_spec_decode_stats(self) -> dict[str, dict]:
+        """Return accept-rate stats for all completed requests, keyed by external request_id.
+
+        vllm internally appends a UUID suffix to request IDs; this method strips
+        that suffix so the keys match the request_id values on RequestOutput objects.
+        """
+        result = {}
+        for internal_id, stats in self.finished_spec_decode_stats.items():
+            m = _UUID_SUFFIX.search(internal_id)
+            external_id = internal_id[:m.start()] if m else internal_id
+            result[external_id] = stats
+        return result
+
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
@@ -27,8 +54,8 @@ class VLLMScheduler(Scheduler):
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
         
-        num_accepted_spec_tokens = model_runner_output.num_accepted_spec_tokens
-        num_generated_tokens = model_runner_output.num_generated_tokens
+        num_accepted_spec_tokens = getattr(model_runner_output, 'num_accepted_spec_tokens', {})
+        num_generated_tokens = getattr(model_runner_output, 'num_generated_tokens', {})
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
@@ -61,7 +88,7 @@ class VLLMScheduler(Scheduler):
         # whose routing was just D2H'd into model_runner_output.
         routing_data = None
         routing_offsets: dict[str, int] = {}
-        if model_runner_output.routed_experts is not None:
+        if getattr(model_runner_output, 'routed_experts', None) is not None:
             re = model_runner_output.routed_experts
             self.routed_experts_mgr.store_batch(re.routing_data, re.slot_mapping)
             routing_data = re.routing_data.astype(
@@ -104,9 +131,11 @@ class VLLMScheduler(Scheduler):
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
             )
+            num_accepted = 0
+            num_draft_tokens = 0
             if scheduled_spec_token_ids and generated_token_ids:
                 num_draft_tokens = len(scheduled_spec_token_ids)
-                num_accepted = len(generated_token_ids) - 1
+                num_accepted = max(0, len(generated_token_ids) - 1)
                 num_rejected = num_draft_tokens - num_accepted
                 # num_computed_tokens represents the number of tokens
                 # processed in the current step, considering scheduled
@@ -127,6 +156,14 @@ class VLLMScheduler(Scheduler):
                     request_id=req_id,
                 )
 
+            # Accumulate spec decode stats for this request.
+            if num_draft_tokens > 0:
+                entry = self._spec_decode_stats.setdefault(
+                    req_id, {"num_accepted": 0, "num_draft": 0}
+                )
+                entry["num_accepted"] += num_accepted
+                entry["num_draft"] += num_draft_tokens
+
             # Free encoder inputs only after the step has actually executed.
             if request.has_encoder_inputs:
                 self._free_encoder_inputs(request)
@@ -139,8 +176,8 @@ class VLLMScheduler(Scheduler):
             status_before_stop = request.status
             num_output_tokens_before = len(request._output_token_ids)
 
-            req_num_accepted_spec_tokens = num_accepted_spec_tokens.get(req_id, 0)
-            req_num_generated_tokens = num_generated_tokens.get(req_id, 0)
+            req_num_accepted_spec_tokens = num_accepted
+            req_num_generated_tokens = num_draft_tokens
 
             # Check for stop and update request status.
             if new_token_ids:
@@ -171,7 +208,7 @@ class VLLMScheduler(Scheduler):
 
             routed_experts = None
             if (
-                self.enable_return_routed_experts
+                getattr(self, 'enable_return_routed_experts', False)
                 and routing_data is not None
                 and new_token_ids
             ):
@@ -217,6 +254,12 @@ class VLLMScheduler(Scheduler):
                 finished = self._handle_stopped_request(request)
                 if finished:
                     kv_transfer_params = self._free_request(request)
+                    # Finalize spec decode stats for this completed request.
+                    s = self._spec_decode_stats.pop(req_id, None)
+                    if s is not None:
+                        total = s["num_draft"]
+                        s["accept_rate"] = s["num_accepted"] / total if total > 0 else 0.0
+                        self.finished_spec_decode_stats[req_id] = s
 
                 if status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)
@@ -226,7 +269,7 @@ class VLLMScheduler(Scheduler):
             # Extract sample logprobs if needed.
             if (
                 request.sampling_params is not None
-                and request.sampling_params.num_logprobs is not None
+                and request.sampling_params.logprobs is not None
                 and logprobs
             ):
                 new_logprobs = logprobs.slice_request(req_index, len(new_token_ids))
@@ -253,7 +296,6 @@ class VLLMScheduler(Scheduler):
                         pooling_output=pooler_output,
                         stop_reason=request.stop_reason,
                         events=request.take_events(),
-                        prefill_stats=request.take_prefill_stats(),
                         kv_transfer_params=kv_transfer_params,
                         trace_headers=request.trace_headers,
                         routed_experts=routed_experts,

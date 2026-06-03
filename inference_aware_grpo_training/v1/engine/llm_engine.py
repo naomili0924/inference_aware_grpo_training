@@ -4,7 +4,10 @@ from vllm.v1.executor.abstract import Executor
 from vllm.usage.usage_lib import UsageContext
 from vllm.v1.metrics.loggers import StatLoggerFactory, StatLoggerManager
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
-from inference_aware_grpo_training.v1.engine.core_client import make_client
+import vllm.v1.engine.core_client as _cc
+
+from inference_aware_grpo_training.v1.engine.core_client import VLLMInprocClient
+
 
 class VLLMEngine(LLMEngine):
     def __init__(
@@ -18,22 +21,35 @@ class VLLMEngine(LLMEngine):
         mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
         multiprocess_mode: bool = False,
     ) -> None:
-        super().__init__(
-            vllm_config=vllm_config,
-            executor_class=executor_class,
-            log_stats=log_stats,
-            aggregate_engine_logging=aggregate_engine_logging,
-            usage_context=usage_context,
-            stat_loggers=stat_loggers,
-            mm_registry=mm_registry,
-            multiprocess_mode=multiprocess_mode,
-        )
+        # Temporarily patch make_client so super().__init__() creates VLLMInprocClient
+        # instead of the default InprocClient, avoiding a second model load.
+        original_make_client = _cc.EngineCoreClient.make_client
 
-        self.engine_core = make_client(
-            multiprocess_mode=multiprocess_mode,
-            asyncio_mode=False,
-            vllm_config=vllm_config,
-            executor_class=executor_class,
-            log_stats=self.log_stats,
-        )
-        
+        def patched_make_client(
+            multiprocess_mode,
+            asyncio_mode,
+            vllm_config,
+            executor_class,
+            log_stats,
+        ):
+            return VLLMInprocClient(vllm_config, executor_class, log_stats)
+
+        _cc.EngineCoreClient.make_client = staticmethod(patched_make_client)
+        try:
+            super().__init__(
+                vllm_config=vllm_config,
+                executor_class=executor_class,
+                log_stats=log_stats,
+                aggregate_engine_logging=aggregate_engine_logging,
+                usage_context=usage_context,
+                stat_loggers=stat_loggers,
+                mm_registry=mm_registry,
+                multiprocess_mode=multiprocess_mode,
+            )
+        finally:
+            _cc.EngineCoreClient.make_client = staticmethod(original_make_client)
+        # self.engine_core is now set to VLLMInprocClient by super().__init__()
+
+    def get_spec_decode_stats(self) -> dict[str, dict]:
+        """Return spec decode accept-rate stats for all completed requests."""
+        return self.engine_core.engine_core.scheduler.get_spec_decode_stats()

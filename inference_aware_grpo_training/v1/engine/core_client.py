@@ -17,15 +17,8 @@ class VLLMInprocClient(InprocClient):
         executor_class: type[Executor],
         log_stats: bool,
     ):
-        # IMPORTANT: pass args to parent so EngineCore is constructed correctly
-        super().__init__(
-            vllm_config,
-            executor_class,
-            log_stats,
-        )
-
-        # OPTIONAL: replace engine_core with your custom implementation
-        # ONLY if VLLMEngineCore is compatible with EngineCore API
+        # Skip super().__init__() — it would create a plain EngineCore (a full
+        # model load) that we immediately discard. Create VLLMEngineCore directly.
         self.engine_core = VLLMEngineCore(
             vllm_config,
             executor_class,

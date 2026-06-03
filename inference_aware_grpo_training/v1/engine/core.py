@@ -21,23 +21,17 @@ class VLLMEngineCore(EngineCore):
         executor_fail_callback: Callable | None = None,
         include_finished_set: bool = False,
     ):
-        # IMPORTANT: pass required args to EngineCore if your vLLM version expects them
-        super().__init__(vllm_config=vllm_config, executor_class=executor_class, log_stats=log_stats)
+        super().__init__(
+            vllm_config=vllm_config,
+            executor_class=executor_class,
+            log_stats=log_stats,
+            executor_fail_callback=executor_fail_callback,
+            include_finished_set=include_finished_set,
+        )
 
-        # Setup KV Caches and update CacheConfig after profiling.
-        kv_cache_config = self._initialize_kv_caches(vllm_config)
-        self.structured_output_manager = StructuredOutputManager(vllm_config)
-
-        # Setup scheduler.
-        Scheduler = vllm_config.scheduler_config.get_scheduler_cls()
-
-        if len(kv_cache_config.kv_cache_groups) == 0:  # noqa: SIM102
-            # Encoder models without KV cache don't support
-            # chunked prefill. But do SSM models?
-            if vllm_config.scheduler_config.enable_chunked_prefill:
-                logger.warning("Disabling chunked prefill for model without KVCache")
-                vllm_config.scheduler_config.enable_chunked_prefill = False
-
+        # super().__init__() created a default Scheduler. Replace it with
+        # VLLMScheduler, reusing the already-computed kv_cache_config.
+        kv_cache_config = self.scheduler.kv_cache_config
         scheduler_block_size = (
             vllm_config.cache_config.block_size
             * vllm_config.parallel_config.decode_context_parallel_size
@@ -127,17 +121,6 @@ class VLLMEngineCore(EngineCore):
             model_output = future.result()
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
-                tmp = self.compute_spec_decode_stats(scheduler_output, model_output)
-                for key, value in tmp.items():
-                    model_output.num_accepted_spec_tokens[key] = (
-                        model_output.num_accepted_spec_tokens.get(key, 0)
-                        + value['num_accepted_tokens']
-                    )
-                    
-                    model_output.num_generated_tokens[key] = (
-                        model_output.num_generated_tokens.get(key, 0)
-                        + value['num_generated_tokens']
-                    )
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.

@@ -4,7 +4,8 @@ from vllm import LLM
 from vllm.engine.arg_utils import EngineArgs
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.counter import Counter
-from vllm.entrypoints.chat_utils import load_chat_template
+from vllm.entrypoints.chat_utils import load_chat_template, ChatTemplateConfig
+from vllm.entrypoints.pooling.io_processor_factories import init_pooling_io_processors
 
 from inference_aware_grpo_training.v1.engine.llm_engine import VLLMEngine
 
@@ -78,3 +79,13 @@ class VLLM(LLM):
 
         # cache repr
         self._cached_repr: str | None = None
+
+    def get_spec_decode_stats(self) -> dict[str, dict]:
+        """Return spec decode accept-rate stats for all completed requests.
+
+        Returns a dict keyed by request_id with keys:
+            num_accepted  - total accepted draft tokens across all decode steps
+            num_draft     - total draft tokens scheduled
+            accept_rate   - num_accepted / num_draft
+        """
+        return self.llm_engine.get_spec_decode_stats()
