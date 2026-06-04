@@ -1,4 +1,4 @@
-# Inference-Aware GRPO Training
+# Inference-Aware Reinforcement Learning Training Framework
 
 A lightweight extension of vLLM that exposes speculative decoding statistics during inference, enabling research on **inference-aware reinforcement learning** and **GRPO-style training objectives**.
 
