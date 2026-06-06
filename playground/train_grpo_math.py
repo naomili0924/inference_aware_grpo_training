@@ -66,10 +66,13 @@ class GRPOConfig:
 
     # training
     learning_rate: float = 1e-6
-    num_epochs: int = 3
+    num_epochs: int = 20           # upper bound; early stopping may halt sooner
     batch_size: int = 4
     grad_clip: float = 1.0
     weight_sync_every: int = 1     # sync vllm weights every N steps
+
+    # early stopping
+    early_stop_patience: int = 3   # stop if eval accuracy doesn't improve for N epochs
 
     # adaptive curriculum scheduler
     n_buckets: int = 3
@@ -334,11 +337,14 @@ def main() -> None:
     print(f"  Baseline accuracy: {baseline_acc:.1%}\n")
 
     print(
-        f"Starting GRPO — {cfg.num_epochs} epochs, batch={cfg.batch_size}, "
-        f"base_rollout={cfg.base_rollout_steps}, alpha={cfg.rollout_alpha}\n"
+        f"Starting GRPO — up to {cfg.num_epochs} epochs, batch={cfg.batch_size}, "
+        f"base_rollout={cfg.base_rollout_steps}, alpha={cfg.rollout_alpha}, "
+        f"patience={cfg.early_stop_patience}\n"
     )
 
     global_step = 0
+    best_acc = baseline_acc
+    epochs_without_improvement = 0
 
     for epoch in range(cfg.num_epochs):
         sampler = scheduler.get_sampler()
@@ -421,16 +427,27 @@ def main() -> None:
         metrics = scheduler.end_epoch()
         print(scheduler.log_cluster_report())
 
-        # ── 8. Periodic eval ──────────────────────────────────────────────
+        # ── 8. Periodic eval + early stopping ────────────────────────────
         if (epoch + 1) % cfg.eval_every == 0:
             acc = evaluate(llm, eval_ds, cfg.eval_samples, cfg.max_new_tokens)
-            print(f"\n  >>> Eval accuracy after epoch {epoch+1}: {acc:.1%}\n")
+            improved = acc > best_acc
+            if improved:
+                best_acc = acc
+                epochs_without_improvement = 0
+                marker = "  ★ new best"
+            else:
+                epochs_without_improvement += 1
+                marker = f"  (no improvement {epochs_without_improvement}/{cfg.early_stop_patience})"
 
-    # ── Final eval ────────────────────────────────────────────────────────
-    print("\nFinal eval...")
-    final_acc = evaluate(llm, eval_ds, cfg.eval_samples, cfg.max_new_tokens)
-    print(f"  Baseline: {baseline_acc:.1%}  →  Final: {final_acc:.1%}")
-    print("\nTraining complete.")
+            print(f"\n  >>> Eval accuracy after epoch {epoch+1}: {acc:.1%}{marker}\n")
+
+            if epochs_without_improvement >= cfg.early_stop_patience:
+                print(f"Early stopping: no improvement for {cfg.early_stop_patience} epochs.")
+                break
+
+    # ── Final summary ─────────────────────────────────────────────────────
+    print(f"\nTraining complete.")
+    print(f"  Baseline: {baseline_acc:.1%}  →  Best: {best_acc:.1%}  (epoch {epoch+1})")
 
 
 if __name__ == "__main__":
