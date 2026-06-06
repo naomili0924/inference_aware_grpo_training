@@ -271,8 +271,15 @@ class AdaptiveBucketizer:
 
     def fit(self, rewards: np.ndarray) -> "AdaptiveBucketizer":
         """Compute adaptive bucket boundaries from current reward distribution."""
-        rewards_clipped = np.clip(rewards, 0.0, 1.0)
-        self.boundaries_ = self._find_valleys(rewards_clipped)
+        r_min = float(rewards.min())
+        r_max = float(rewards.max())
+        r_range = max(r_max - r_min, 1e-8)
+        self._r_min = r_min
+        self._r_range = r_range
+        rewards_norm = (rewards - r_min) / r_range   # [0, 1] preserving distribution shape
+        boundaries_norm = self._find_valleys(rewards_norm)
+        # Transform boundaries back to raw reward space so assign() works on raw values
+        self.boundaries_ = [b * r_range + r_min for b in boundaries_norm]
         return self
 
     def assign(self, rewards: np.ndarray) -> np.ndarray:
@@ -292,11 +299,12 @@ class AdaptiveBucketizer:
     ) -> List[dict]:
         """Return per-bucket stats for logging."""
         boundaries = self.boundaries_ or []
-        # Build boundary ranges per bucket — always produce n_buckets+1 edges
-        edges = [0.0] + list(boundaries) + [1.0]
+        r_min = float(rewards.min())
+        r_max = float(rewards.max())
+        edges = [r_min] + list(boundaries) + [r_max]
         # Pad edges to ensure index b and b+1 always exist for any bucket id
         while len(edges) < self.n_buckets + 1:
-            edges.append(1.0)
+            edges.append(r_max)
         n_total = len(rewards)
         summary = []
         for b in range(self.n_buckets):
@@ -506,18 +514,21 @@ class DatasetScheduler:
                 "median_reward": float(np.median(ema)),
                 "p25_reward":    float(np.percentile(ema, 25)),
                 "p75_reward":    float(np.percentile(ema, 75)),
-                "boundary_low":  0.0, "boundary_high": 1.0,
+                "boundary_low":  float(ema.min()), "boundary_high": float(ema.max()),
                 "pct_of_total":  1.0,
             }]
         self._last_summary = summary
 
         # Build BucketMetrics list
         cfg = self.cfg
+        ema_min = float(ema.min())
+        ema_range = max(float(ema.max()) - ema_min, 1e-8)
         bucket_metrics = []
         for s in summary:
             b = s["bucket"]
+            normalized_reward = (s["mean_reward"] - ema_min) / ema_range
             rollout_n = rollout_steps_for_bucket(
-                s["mean_reward"], cfg.base_rollout_steps, cfg.rollout_alpha
+                normalized_reward, cfg.base_rollout_steps, cfg.rollout_alpha
             )
             bucket_metrics.append(BucketMetrics(
                 bucket_id=b,
@@ -574,25 +585,29 @@ class DatasetScheduler:
             # Before any bucketing: all samples in bucket 0
             bucket_ids = np.zeros(self._n, dtype=int)
             mean_rewards = {0: 0.5}
+            ema_min, ema_range = 0.0, 1.0
         else:
             bucket_ids = self._last_bucket_ids
             ema = self.tracker.ema_rewards
+            ema_min = float(ema.min())
+            ema_range = max(float(ema.max()) - ema_min, 1e-8)
             mean_rewards = {}
             for b in range(cfg.n_buckets):
                 mask = bucket_ids == b
                 r = ema[mask]
-                mean_rewards[b] = float(r.mean()) if len(r) else 0.5
+                mean_rewards[b] = float(r.mean()) if len(r) else float(ema.mean())
 
         # Build bucket → [indices] map
         bucket_to_indices: dict[int, List[int]] = defaultdict(list)
         for idx, b in enumerate(bucket_ids):
             bucket_to_indices[int(b)].append(idx)
 
-        # Compute rollout steps per bucket
+        # Compute rollout steps per bucket (normalize mean_reward to [0,1] first)
         bucket_to_rollout: dict[int, int] = {}
         for b, mr in mean_rewards.items():
+            normalized_reward = (mr - ema_min) / ema_range
             bucket_to_rollout[b] = rollout_steps_for_bucket(
-                mean_reward=mr,
+                mean_reward=normalized_reward,
                 base_rollout_steps=cfg.base_rollout_steps,
                 alpha=cfg.rollout_alpha,
             )
