@@ -12,16 +12,21 @@ Reward function:
 The model is trained to produce correct answers AND be predictable by
 the draft model, making speculative decoding more efficient over time.
 
+Adaptive curriculum via DatasetScheduler:
+    - After each epoch, samples are grouped into reward buckets using KDE.
+    - Harder buckets (lower mean reward) get more rollout steps:
+          rollout_steps = base_rollout_steps * (1 + alpha * (1 - mean_reward))
+    - A cluster report is printed after every epoch.
+
 Usage:
     python playground/train_grpo_math.py
 """
 
 import re
-import time
 import torch
 import torch.nn.functional as F
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional
+from typing import List, Optional
 
 import multiprocessing as mp
 from datasets import load_dataset
@@ -29,6 +34,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from vllm import SamplingParams
 
 from inference_aware_grpo_training import VLLM
+from inference_aware_grpo_training.data_scheduler import DatasetScheduler, SchedulerConfig
 
 
 # ─── Config ───────────────────────────────────────────────────────────────────
@@ -52,20 +58,25 @@ class GRPOConfig:
     dataset_config: str = "main"
     max_train_samples: int = 500   # subset for quick experiments; set None for full
 
-    # rollout
-    num_rollouts_per_prompt: int = 4
+    # rollout — dynamic per bucket; base is for the easiest (highest-reward) bucket
+    base_rollout_steps: int = 4
+    rollout_alpha: float = 1.5     # harder buckets: steps = base * (1 + alpha*(1-mean_r))
     max_new_tokens: int = 512      # math needs more tokens for chain-of-thought
     temperature: float = 0.8
 
     # training
     learning_rate: float = 1e-6
-    num_train_steps: int = 50
+    num_epochs: int = 3
     batch_size: int = 4
     grad_clip: float = 1.0
-    weight_sync_every: int = 1
+    weight_sync_every: int = 1     # sync vllm weights every N steps
+
+    # adaptive curriculum scheduler
+    n_buckets: int = 3
+    ema_decay: float = 0.7
 
     # eval
-    eval_every: int = 10           # eval accuracy every N steps
+    eval_every: int = 1            # eval accuracy every N epochs
     eval_samples: int = 100        # number of test problems to evaluate
 
     # vllm
@@ -305,82 +316,114 @@ def main() -> None:
         max_tokens=cfg.max_new_tokens,
     )
 
+    # ── Adaptive curriculum scheduler ────────────────────────────────────
+    sched_cfg = SchedulerConfig(
+        base_rollout_steps=cfg.base_rollout_steps,
+        rollout_alpha=cfg.rollout_alpha,
+        ema_decay=cfg.ema_decay,
+        n_buckets=cfg.n_buckets,
+        batch_size=cfg.batch_size,
+        min_epochs_before_bucketing=1,
+    )
+    scheduler = DatasetScheduler(train_ds, sched_cfg)
+
     # ── Baseline eval ─────────────────────────────────────────────────────
     print(f"\nBaseline eval on {cfg.eval_samples} test problems...")
     baseline_acc = evaluate(llm, eval_ds, cfg.eval_samples, cfg.max_new_tokens)
     print(f"  Baseline accuracy: {baseline_acc:.1%}\n")
 
-    print(f"Starting GRPO — {cfg.num_train_steps} steps, "
-          f"batch={cfg.batch_size}, G={cfg.num_rollouts_per_prompt}\n")
+    print(
+        f"Starting GRPO — {cfg.num_epochs} epochs, batch={cfg.batch_size}, "
+        f"base_rollout={cfg.base_rollout_steps}, alpha={cfg.rollout_alpha}\n"
+    )
 
-    for step in range(cfg.num_train_steps):
+    global_step = 0
 
-        # ── 1. Sample a batch of problems ─────────────────────────────────
-        idx = torch.randint(len(train_ds), (cfg.batch_size,)).tolist()
-        batch = train_ds.select(idx)
-        batch_prompts    = [format_prompt(ex["question"]) for ex in batch]
-        batch_gt_answers = [extract_gt_answer(ex["answer"]) for ex in batch]
+    for epoch in range(cfg.num_epochs):
+        sampler = scheduler.get_sampler()
+        print(f"── Epoch {epoch + 1}/{cfg.num_epochs}  "
+              f"({len(sampler)} batches) ─────────────────────────")
 
-        # ── 2. Generate G rollouts per problem ────────────────────────────
-        all_prompts, all_responses, all_rewards = [], [], []
-        all_correct, all_accept, all_latency = [], [], []
+        for batch_indices in sampler:
+            global_step += 1
 
-        for _ in range(cfg.num_rollouts_per_prompt):
-            outputs    = llm.generate(batch_prompts, sampling_params)
-            spec_stats = llm.get_spec_decode_stats()
-            rewards    = compute_rewards(
-                outputs, batch_gt_answers, spec_stats, llm, cfg.reward
+            # ── 1. Build batch ────────────────────────────────────────────
+            batch            = train_ds.select(batch_indices)
+            batch_prompts    = [format_prompt(ex["question"]) for ex in batch]
+            batch_gt_answers = [extract_gt_answer(ex["answer"]) for ex in batch]
+
+            # Dynamic rollout steps: harder bucket → more exploration
+            rollout_n = sampler.rollout_steps_for_batch(batch_indices[0])
+
+            # ── 2. Generate rollout_n rollouts per problem ────────────────
+            all_prompts, all_responses, all_rewards = [], [], []
+            all_correct, all_accept, all_latency = [], [], []
+
+            for _ in range(rollout_n):
+                outputs    = llm.generate(batch_prompts, sampling_params)
+                spec_stats = llm.get_spec_decode_stats()
+                rewards    = compute_rewards(
+                    outputs, batch_gt_answers, spec_stats, llm, cfg.reward
+                )
+
+                # Feed rewards back to scheduler for next epoch's bucketing
+                scheduler.record_rewards(batch_indices, rewards)
+
+                for i, (out, r) in enumerate(zip(outputs, rewards)):
+                    m     = out.metrics
+                    stats = spec_stats.get(out.request_id, {})
+                    pred  = extract_answer(out.outputs[0].text)
+
+                    all_prompts.append(out.prompt)
+                    all_responses.append(out.outputs[0].text)
+                    all_rewards.append(r)
+                    all_correct.append(1.0 if answers_match(pred, batch_gt_answers[i]) else 0.0)
+                    all_accept.append(stats.get("accept_rate", 0.0))
+                    all_latency.append(
+                        (m.last_token_ts - m.queued_ts) * 1e3 if m else 0.0
+                    )
+
+            # ── 3. Group-relative advantages ──────────────────────────────
+            rewards_t  = torch.tensor(all_rewards, dtype=torch.float32)
+            advantages = _znorm(rewards_t, cfg.norm_eps)
+
+            # ── 4. GRPO gradient step ─────────────────────────────────────
+            optimizer.zero_grad()
+            loss = compute_grpo_loss(
+                hf_model, tokenizer,
+                all_prompts, all_responses,
+                advantages.to(hf_model.device),
+            )
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(hf_model.parameters(), cfg.grad_clip)
+            optimizer.step()
+
+            # ── 5. Sync weights to vllm ───────────────────────────────────
+            if global_step % cfg.weight_sync_every == 0:
+                sync_weights_to_vllm(hf_model, llm)
+
+            # ── 6. Log ────────────────────────────────────────────────────
+            correct_t = torch.tensor(all_correct)
+            accept_t  = torch.tensor(all_accept)
+            lat_t     = torch.tensor(all_latency)
+
+            print(
+                f"  step {global_step:4d} | epoch {epoch+1} | "
+                f"rollouts={rollout_n} | loss={loss.item():.4f} | "
+                f"correct={correct_t.mean():.2f} | "
+                f"accept={accept_t.mean():.3f} | "
+                f"latency={lat_t.mean():.0f}ms | "
+                f"reward={rewards_t.mean():.3f}"
             )
 
-            for out, r in zip(outputs, rewards):
-                m      = out.metrics
-                stats  = spec_stats.get(out.request_id, {})
-                pred   = extract_answer(out.outputs[0].text)
-                gt     = batch_gt_answers[outputs.index(out) % cfg.batch_size]
+        # ── 7. End of epoch: re-bucket and report ─────────────────────────
+        metrics = scheduler.end_epoch()
+        print(scheduler.log_cluster_report())
 
-                all_prompts.append(out.prompt)
-                all_responses.append(out.outputs[0].text)
-                all_rewards.append(r)
-                all_correct.append(1.0 if answers_match(pred, gt) else 0.0)
-                all_accept.append(stats.get("accept_rate", 0.0))
-                all_latency.append((m.last_token_ts - m.queued_ts) * 1e3 if m else 0.0)
-
-        # ── 3. Group-relative advantages ──────────────────────────────────
-        rewards_t  = torch.tensor(all_rewards, dtype=torch.float32)
-        advantages = _znorm(rewards_t, cfg.norm_eps)
-
-        # ── 4. GRPO gradient step ─────────────────────────────────────────
-        optimizer.zero_grad()
-        loss = compute_grpo_loss(
-            hf_model, tokenizer,
-            all_prompts, all_responses,
-            advantages.to(hf_model.device),
-        )
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(hf_model.parameters(), cfg.grad_clip)
-        optimizer.step()
-
-        # ── 5. Sync weights to vllm ───────────────────────────────────────
-        if (step + 1) % cfg.weight_sync_every == 0:
-            sync_weights_to_vllm(hf_model, llm)
-
-        # ── 6. Log ────────────────────────────────────────────────────────
-        correct_t = torch.tensor(all_correct)
-        accept_t  = torch.tensor(all_accept)
-        lat_t     = torch.tensor(all_latency)
-
-        print(
-            f"step {step+1:4d} | loss={loss.item():.4f} | "
-            f"correct={correct_t.mean():.2f} | "
-            f"accept={accept_t.mean():.3f} | "
-            f"latency={lat_t.mean():.0f}ms | "
-            f"reward={rewards_t.mean():.3f}"
-        )
-
-        # ── 7. Periodic eval ──────────────────────────────────────────────
-        if (step + 1) % cfg.eval_every == 0:
+        # ── 8. Periodic eval ──────────────────────────────────────────────
+        if (epoch + 1) % cfg.eval_every == 0:
             acc = evaluate(llm, eval_ds, cfg.eval_samples, cfg.max_new_tokens)
-            print(f"\n  >>> Eval accuracy after step {step+1}: {acc:.1%}\n")
+            print(f"\n  >>> Eval accuracy after epoch {epoch+1}: {acc:.1%}\n")
 
     # ── Final eval ────────────────────────────────────────────────────────
     print("\nFinal eval...")
