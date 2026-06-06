@@ -161,6 +161,41 @@ The `task_score` defaults to `1.0` — plug in your own quality scorer via the `
 Trains on [openai/gsm8k](https://huggingface.co/datasets/openai/gsm8k) (7,473 train / 1,319 test problems).  
 `task_score` is replaced with **exact answer correctness** (1.0 correct / 0.0 wrong).
 
+### Adaptive Curriculum with `DatasetScheduler`
+
+The training loop uses a reward-based data scheduler that groups samples into difficulty buckets and assigns more rollouts to harder samples.
+
+**How it works:**
+
+1. **Reward tracking** — each sample's reward is tracked with EMA smoothing across epochs (`ema_decay=0.7`), giving a stable difficulty signal that updates as the model improves.
+2. **KDE bucketing** — after each epoch, Gaussian KDE is run on the reward distribution to find natural valley boundaries, splitting samples into `n_buckets=3` adaptive clusters.
+3. **Dynamic rollout steps** — harder buckets (lower mean reward) receive more rollout iterations:
+   ```
+   rollout_steps = base_rollout_steps × (1 + α × (1 − mean_reward))
+   ```
+   With `base_rollout_steps=4` and `α=1.5`, a bucket with `mean_reward=0` gets 10 rollouts while a bucket with `mean_reward=1` gets exactly 4.
+4. **Cluster report** — printed after every epoch with per-bucket stats, IQR, ASCII histogram, and health indicators (spread + balance).
+
+Example cluster report after epoch 2:
+```
+╔══ Epoch 2 — Cluster Report ════════════════════════════════════════╗
+│ global  mean=0.387  std=0.201  min=0.031  max=0.947
+│ spread=0.218 ▲ clusters separating   balance=0.84 ✓ balanced
+│ boundaries: 0.241  |  0.612
+╠────────────────────────────────────────────────────────────────────
+│ bucket 0  [0.00–0.24]  n=  178 (35.6%)  rollout=14
+│   mean=0.142 ± 0.058   median=0.139
+│   IQR [0.00  ────────┼─────────────         0.24]  p25=0.091  p75=0.198
+│   hist [████████▓▓▓░░░░                              ]
+│────────────────────────────────────────────────────────────────────
+│ bucket 1  [0.24–0.61]  n=  187 (37.4%)  rollout=8
+│   mean=0.423 ± 0.101   median=0.419
+│   IQR [0.24       ────────────┼───────────           0.61]  ...
+│ bucket 2  [0.61–1.00]  n=  135 (27.0%)  rollout=4
+│   mean=0.791 ± 0.089   median=0.803
+╚════════════════════════════════════════════════════════════════════╝
+```
+
 ### Results — 50 Steps
 
 Target: `Qwen/Qwen2.5-1.5B-Instruct` · Draft: `Qwen/Qwen2.5-0.5B-Instruct`  
@@ -213,10 +248,14 @@ Key config knobs in `GRPOConfig`:
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `max_train_samples` | 500 | Set to `None` for all 7,473 examples |
-| `num_train_steps` | 50 | Training steps |
-| `eval_every` | 10 | Eval on test set every N steps |
+| `num_epochs` | 3 | Training epochs (full passes over the dataset) |
+| `batch_size` | 4 | Problems per batch |
+| `base_rollout_steps` | 4 | Rollouts for the easiest (highest-reward) bucket |
+| `rollout_alpha` | 1.5 | Controls rollout scaling for harder buckets |
+| `n_buckets` | 3 | Number of adaptive difficulty buckets |
+| `ema_decay` | 0.7 | EMA smoothing for per-sample reward history |
+| `eval_every` | 1 | Eval on test set every N epochs |
 | `eval_samples` | 100 | Test problems per eval |
-| `num_rollouts_per_prompt` | 4 | G in GRPO |
 | `max_new_tokens` | 512 | Tokens for chain-of-thought |
 
 ---
@@ -225,6 +264,7 @@ Key config knobs in `GRPOConfig`:
 
 ```
 inference_aware_grpo_training/
+├── data_scheduler.py           # Adaptive curriculum: RewardTracker, AdaptiveBucketizer, DatasetScheduler
 ├── entrypoints/
 │   └── llm.py                  # VLLM class (drop-in for vllm.LLM) + get_spec_decode_stats()
 ├── v1/
@@ -237,7 +277,7 @@ inference_aware_grpo_training/
 playground/
 ├── main.py                     # Spec decode accept rate demo (5 requests)
 ├── train_grpo.py               # Generic GRPO training loop
-└── train_grpo_math.py          # GRPO on GSM8K with answer correctness reward
+└── train_grpo_math.py          # GRPO on GSM8K with adaptive curriculum + dynamic rollouts
 ```
 
 ---
