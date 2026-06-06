@@ -363,7 +363,11 @@ def main() -> None:
             rollout_n = sampler.rollout_steps_for_batch(batch_indices[0])
 
             # ── 2. Generate rollout_n rollouts per problem ────────────────
-            all_prompts, all_responses, all_rewards = [], [], []
+            # Collect all rollouts first so we can compute group-relative
+            # advantages across the full group before any gradient step.
+            rollout_prompts_list: List[List[str]] = []
+            rollout_responses_list: List[List[str]] = []
+            all_rewards: List[float] = []
             all_correct, all_accept, all_latency = [], [], []
 
             for _ in range(rollout_n):
@@ -376,13 +380,14 @@ def main() -> None:
                 # Feed rewards back to scheduler for next epoch's bucketing
                 scheduler.record_rewards(batch_indices, rewards)
 
+                r_prompts, r_responses = [], []
                 for i, (out, r) in enumerate(zip(outputs, rewards)):
                     m     = out.metrics
                     stats = spec_stats.get(out.request_id, {})
                     pred  = extract_answer(out.outputs[0].text)
 
-                    all_prompts.append(out.prompt)
-                    all_responses.append(out.outputs[0].text)
+                    r_prompts.append(out.prompt)
+                    r_responses.append(out.outputs[0].text)
                     all_rewards.append(r)
                     all_correct.append(1.0 if answers_match(pred, batch_gt_answers[i]) else 0.0)
                     all_accept.append(stats.get("accept_rate", 0.0))
@@ -390,18 +395,30 @@ def main() -> None:
                         (m.last_token_ts - m.queued_ts) * 1e3 if m else 0.0
                     )
 
+                rollout_prompts_list.append(r_prompts)
+                rollout_responses_list.append(r_responses)
+
             # ── 3. Group-relative advantages ──────────────────────────────
             rewards_t  = torch.tensor(all_rewards, dtype=torch.float32)
-            advantages = _znorm(rewards_t, cfg.norm_eps)
+            advantages = _znorm(rewards_t, cfg.norm_eps).to(hf_model.device)
 
-            # ── 4. GRPO gradient step ─────────────────────────────────────
+            # ── 4. GRPO gradient step with per-rollout accumulation ───────
+            # Forward/backward one rollout at a time (batch_size sequences
+            # per pass) so peak memory is independent of rollout_n.
             optimizer.zero_grad()
-            loss = compute_grpo_loss(
-                hf_model, tokenizer,
-                all_prompts, all_responses,
-                advantages.to(hf_model.device),
-            )
-            loss.backward()
+            total_loss = 0.0
+            bs = len(batch_indices)
+            for k, (r_prompts, r_responses) in enumerate(
+                zip(rollout_prompts_list, rollout_responses_list)
+            ):
+                adv_k = advantages[k * bs : (k + 1) * bs]
+                loss_k = compute_grpo_loss(
+                    hf_model, tokenizer, r_prompts, r_responses, adv_k
+                )
+                (loss_k / rollout_n).backward()   # scale so sum == mean over rollouts
+                total_loss += loss_k.item()
+
+            loss_scalar = total_loss / rollout_n
             torch.nn.utils.clip_grad_norm_(hf_model.parameters(), cfg.grad_clip)
             optimizer.step()
 
@@ -416,7 +433,7 @@ def main() -> None:
 
             print(
                 f"  step {global_step:4d} | epoch {epoch+1} | "
-                f"rollouts={rollout_n} | loss={loss.item():.4f} | "
+                f"rollouts={rollout_n} | loss={loss_scalar:.4f} | "
                 f"correct={correct_t.mean():.2f} | "
                 f"accept={accept_t.mean():.3f} | "
                 f"latency={lat_t.mean():.0f}ms | "
