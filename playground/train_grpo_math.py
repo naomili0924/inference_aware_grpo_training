@@ -80,7 +80,7 @@ class GRPOConfig:
     eval_samples: int = 100        # number of test problems to evaluate
 
     # vllm
-    gpu_memory_utilization: float = 0.4
+    gpu_memory_utilization: float = 0.2
     max_model_len: int = 1024
     num_speculative_tokens: int = 5
 
@@ -295,6 +295,7 @@ def main() -> None:
     hf_model = AutoModelForCausalLM.from_pretrained(
         cfg.target_model, dtype=torch.bfloat16, device_map="cuda",
     )
+    hf_model.gradient_checkpointing_enable()
     hf_model.train()
     optimizer = torch.optim.AdamW(hf_model.parameters(), lr=cfg.learning_rate)
 
