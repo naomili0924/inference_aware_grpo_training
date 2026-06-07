@@ -19,6 +19,7 @@ This repository provides:
 - A drop-in replacement for `vllm.LLM`
 - A full GRPO training loop with an inference-aware composite reward
 - GSM8K math training with exact answer correctness as the task score
+- An adaptive curriculum scheduler that uses KDE-based reward bucketing to dynamically assign more rollout iterations to harder training samples, improving sample efficiency during GRPO training
 
 ---
 
