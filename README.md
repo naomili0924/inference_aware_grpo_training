@@ -1,25 +1,20 @@
 # Inference-Aware Reinforcement Learning Training Framework
 
-A lightweight extension of vLLM that exposes speculative decoding statistics during inference, enabling research on **inference-aware reinforcement learning** and **GRPO-style training objectives**.
+LLMs are trained to produce correct outputs — but correctness alone doesn't determine serving cost. A model that generates verbose, unpredictable, or cache-unfriendly responses is expensive to deploy, even if its answers are right. **This project makes inference efficiency a first-class training objective.**
 
-The project replaces the default vLLM engine with a custom engine that tracks speculative decoding acceptance rates and other decoding efficiency metrics while maintaining compatibility with the standard `vllm.LLM` API.
+The key insight is that speculative decoding gives us a live, per-request signal of inference cost: the **draft token acceptance rate**. When a small draft model's predictions are frequently accepted by the larger target model, decoding is fast and cheap. When they are rejected, the target must do more work. By feeding this acceptance rate — alongside latency, token length, and KV memory — back into the GRPO training reward, the model learns to generate outputs that are simultaneously high-quality and inference-efficient.
+
+On top of this, an **adaptive curriculum scheduler** uses KDE-based reward bucketing to detect which training samples the model finds hardest and automatically allocates more rollout iterations to them — improving sample efficiency across GRPO epochs.
 
 ---
 
-## Motivation
+## What this repo provides
 
-Modern language model training optimizes for output quality but is largely unaware of inference efficiency.
-
-Speculative decoding introduces a draft model that proposes tokens which are then verified by a larger target model. The efficiency of speculative decoding depends heavily on the draft model's acceptance rate.
-
-This repository provides:
-
-- A custom vLLM engine with speculative decoding telemetry
-- Per-request acceptance rate statistics accessible after `generate()`
-- A drop-in replacement for `vllm.LLM`
-- A full GRPO training loop with an inference-aware composite reward
-- GSM8K math training with exact answer correctness as the task score
-- An adaptive curriculum scheduler that uses KDE-based reward bucketing to dynamically assign more rollout iterations to harder training samples, improving sample efficiency during GRPO training
+- A custom vLLM engine that exposes per-request speculative decoding telemetry
+- Drop-in replacement for `vllm.LLM` with `get_spec_decode_stats()` after `generate()`
+- A GRPO training loop with a composite reward: task correctness + spec accept rate − latency − token length − KV memory
+- GSM8K math training reaching **83% accuracy** (+15pp over a 68% baseline) using exact answer correctness as the task score
+- A `DatasetScheduler` with KDE valley-finding that buckets samples by EMA reward and assigns dynamic rollout counts per difficulty cluster
 
 ---
 
